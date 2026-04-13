@@ -46,7 +46,7 @@ function makeMockCtx() {
   const sent: unknown[] = [];
   return {
     ctx: {
-      sendActivity: vi.fn(async (activity: unknown) => {
+      send: vi.fn(async (activity: unknown) => {
         sent.push(activity);
         return { id: "msg-1" };
       }),
@@ -340,4 +340,3 @@ describe("/session name command", () => {
     expect(handled).toBe(false);
   });
 });
-

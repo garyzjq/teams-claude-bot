@@ -16,6 +16,7 @@ import {
 } from "fs";
 import { join, dirname, resolve } from "path";
 import { homedir } from "os";
+import type { IStreamer } from "@microsoft/teams.apps";
 import { ConversationSession } from "../claude/session.js";
 import { config } from "../config.js";
 import { TEAMS_BOT_DATA_DIR } from "../paths.js";
@@ -24,7 +25,20 @@ import { TEAMS_BOT_DATA_DIR } from "../paths.js";
 
 export interface ManagedSession {
   session: ConversationSession;
-  setRef: (ctx: unknown) => void;
+  /** Teams stream ref from message handler context */
+  stream?: IStreamer;
+  /** Whether stream has been activated (message_start received). Only emit/update when true. */
+  streamActivated?: boolean;
+  /** Resolve callback to signal turn completion (lets handler return) */
+  onTurnComplete?: () => void;
+  /** Whether the stream was proactively expired (timer or 403) */
+  streamExpired?: boolean;
+  /** Activity ID of the prompt suggestion card (auto-deleted on next message) */
+  suggestionCardId?: string;
+  /** Activity ID of the user's latest message (for reactions) */
+  userActivityId?: string;
+  /** Pending reaction to send after stream closes (emoji response). */
+  pendingReaction?: string;
 }
 
 // ─── Persistence ───
@@ -257,4 +271,3 @@ export function setCachedCommands(
 ): void {
   cachedCommands = cmds;
 }
-

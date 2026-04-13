@@ -17,8 +17,11 @@ function required(name: string): string {
   return value;
 }
 
-function expandHome(p: string): string {
-  return p.startsWith("~/") ? resolve(homedir(), p.slice(2)) : resolve(p);
+export function expandHome(p: string): string {
+  if (p === "~") return homedir();
+  if (p.startsWith("~/") || p.startsWith("~\\"))
+    return resolve(homedir(), p.slice(2));
+  return resolve(p);
 }
 
 function parseAllowedUsers(raw?: string): Set<string> {
@@ -84,3 +87,8 @@ export const config = {
   sessionInitPrompt: process.env.SESSION_INIT_PROMPT,
   defaultPermissionMode: process.env.PERMISSION_MODE ?? "default",
 } as const;
+
+// Map existing env vars for Teams SDK (SDK reads CLIENT_ID/CLIENT_SECRET/TENANT_ID)
+process.env.CLIENT_ID = config.microsoftAppId;
+process.env.CLIENT_SECRET = config.microsoftAppPassword;
+process.env.TENANT_ID = config.microsoftAppTenantId;

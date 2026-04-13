@@ -1,81 +1,37 @@
 import { config } from "./config.js";
-import { BotFrameworkAdapter, TurnContext } from "botbuilder";
-import express, {
-  type Request,
-  type Response,
-  type NextFunction,
-} from "express";
-import { ClaudeCodeBot } from "./bot/teams-bot.js";
-import { buildHandoffCard } from "./bot/cards.js";
-import { loadConversationRefs, getConversationRef } from "./handoff/store.js";
-import { getWorkDir, getSession, loadPersistedState } from "./session/state.js";
-
-// Simple in-memory rate limiter (no external dependencies)
-function rateLimit(windowMs: number, maxRequests: number) {
-  const hits = new Map<string, number[]>();
-  return (req: Request, res: Response, next: NextFunction) => {
-    const ip = req.ip ?? "unknown";
-    const now = Date.now();
-    const windowStart = now - windowMs;
-    const timestamps = (hits.get(ip) ?? []).filter((t) => t > windowStart);
-    if (timestamps.length >= maxRequests) {
-      res.status(429).json({ error: "Too many requests" });
-      return;
-    }
-    timestamps.push(now);
-    hits.set(ip, timestamps);
-    // Periodic cleanup
-    if (hits.size > 1000) {
-      for (const [key, ts] of hits) {
-        if (ts.every((t) => t <= windowStart)) hits.delete(key);
-      }
-    }
-    next();
-  };
-}
+import { App, ExpressAdapter } from "@microsoft/teams.apps";
+import { DevtoolsPlugin } from "@microsoft/teams.dev";
+import { MessageActivity } from "@microsoft/teams.api";
+import type { ActivityParams } from "@microsoft/teams.api";
+import type { Request, Response } from "express";
+import {
+  buildHandoffCard,
+  handleCardAction,
+  interactiveCards,
+} from "./bot/cards.js";
+import { loadConversationRefs } from "./handoff/store.js";
+import { registerHandoffRoute } from "./handoff/api.js";
+import { getSession, loadPersistedState } from "./session/state.js";
+import { registerMessageHandler } from "./bot/message.js";
+import { handleHandoff } from "./bot/bridge.js";
 
 // Load persisted state
 loadConversationRefs();
 loadPersistedState();
 
-// Bot Framework adapter
-const adapter = new BotFrameworkAdapter({
-  appId: config.microsoftAppId,
-  appPassword: config.microsoftAppPassword,
-  channelAuthTenant: config.microsoftAppTenantId,
-});
+// Express adapter — gives us access to express get/post for custom routes
+const expressAdapter = new ExpressAdapter();
 
-adapter.onTurnError = async (context, error) => {
-  const msg = error instanceof Error ? error.message : String(error);
-  if (msg.includes("aborted") || msg.includes("interrupted")) {
-    console.log("[BOT] Request aborted (user interrupt)");
-    return;
-  }
-  console.error(`[ERROR] ${error}`);
-  try {
-    await context.sendActivity("Something went wrong. Try again.");
-  } catch {
-    // Ignore send errors in error handler
-  }
-};
-
-// Bot instance
-const bot = new ClaudeCodeBot();
-
-// Express server
-const app = express();
-
-// Security headers
-app.use((_req, res, next) => {
+// Security headers for custom routes
+expressAdapter.use((_req: Request, res: Response, next: () => void) => {
   res.setHeader("X-Content-Type-Options", "nosniff");
   res.setHeader("X-Frame-Options", "DENY");
   res.setHeader("Referrer-Policy", "no-referrer");
   next();
 });
 
-app.use(express.json());
-
-app.get("/healthz", (_req, res) => {
+// Health check (GET route via Express adapter)
+expressAdapter.get("/healthz", (_req: Request, res: Response) => {
   const session = getSession();
   res.json({
     status: "ok",
@@ -89,77 +45,120 @@ app.get("/healthz", (_req, res) => {
   });
 });
 
-app.post("/api/messages", async (req, res) => {
-  try {
-    await adapter.process(req, res, (context) => bot.run(context));
-  } catch (err) {
-    console.error(`[AUTH] ${err instanceof Error ? err.message : err}`);
-    if (!res.headersSent) {
-      res.status(401).end();
+// Handoff API — called by /handoff skill in Claude Code
+registerHandoffRoute(expressAdapter);
+
+// ─── Teams SDK App ───────────────────────────────────────────────────
+const plugins =
+  process.env.TEAMS_DEVTOOLS === "1" ? [new DevtoolsPlugin()] : [];
+
+const teamsApp = new App({
+  httpServerAdapter: expressAdapter,
+  plugins,
+  activity: {
+    mentions: { stripText: true },
+  },
+});
+
+// ─── Card action handler (Action.Execute) ────────────────────────────
+teamsApp.on("card.action", async (ctx) => {
+  const data = (ctx.activity.value?.action?.data ?? {}) as Record<
+    string,
+    unknown
+  >;
+  const conversationId = ctx.ref.conversation?.id;
+
+  const sendFn = async (activity: string | ActivityParams) => {
+    await ctx.send(activity);
+  };
+
+  const deleteFn = conversationId
+    ? async (activityId: string) => {
+        await ctx.api.conversations
+          .activities(conversationId)
+          .delete(activityId);
+      }
+    : undefined;
+
+  const response = await handleCardAction(
+    data,
+    sendFn,
+    deleteFn,
+    ctx.activity.replyToId,
+  );
+
+  // Wire handoff actions that need app-level access
+  const action = data.action as string | undefined;
+  if (action === "handoff_fork") {
+    const card = buildHandoffCard(
+      data.workDir as string,
+      data.sessionId as string | undefined,
+    );
+    await ctx.send(new MessageActivity().addCard("adaptive", card));
+  }
+
+  if (action === "handoff_accept" && conversationId) {
+    // Update the card in-place with "Handed off" status
+    const cardActivityId = ctx.activity.replyToId;
+    if (cardActivityId) {
+      try {
+        const updatedCard = buildHandoffCard(
+          data.workDir as string,
+          data.sessionId as string | undefined,
+          data.summary as string | undefined,
+          data.todos as { content: string; done: boolean }[] | undefined,
+          undefined,
+          data.title as string | undefined,
+          "✅ Handed off",
+        );
+        await ctx.api.conversations
+          .activities(conversationId)
+          .update(
+            cardActivityId,
+            new MessageActivity().addCard("adaptive", updatedCard),
+          );
+      } catch {
+        /* card may be gone */
+      }
     }
+
+    // Fire-and-forget handoff in background
+    handleHandoff(
+      teamsApp,
+      conversationId,
+      interactiveCards,
+      "handoff_accept",
+      data.workDir as string,
+      data.sessionId as string | undefined,
+    ).catch((err: unknown) =>
+      console.error("[HANDOFF] Background error:", err),
+    );
   }
+
+  return response;
 });
 
-// Handoff API - called by Terminal skill to notify Teams
-app.post("/api/handoff", rateLimit(60_000, 10), async (req, res) => {
-  const token = req.headers["x-handoff-token"];
-  if (token !== config.handoffToken) {
-    return res.status(401).json({ success: false, error: "Unauthorized" });
+// ─── Message handler + lifecycle ─────────────────────────────────────
+registerMessageHandler(teamsApp);
+
+// ─── Error handler (must be after all routes) ──────────────────────
+expressAdapter.use(
+  // Express identifies error handlers by their 4-argument signature
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  (err: Error & { type?: string }, _req: Request, res: Response, _next: () => void) => {
+    if (err.type === "entity.too.large") {
+      console.warn("[BOT] Payload too large — rejecting request");
+      res.status(413).json({ error: "Message too large to process." });
+      return;
+    }
+    console.error("[BOT] Unhandled error:", err);
+    res.status(500).json({ error: "Internal server error" });
+  },
+);
+
+// ─── Start ───────────────────────────────────────────────────────────
+teamsApp.start(config.port).then(() => {
+  if (process.env.TEAMS_DEVTOOLS === "1") {
+    console.log(`DevTools on :${config.port + 1}`);
   }
-
-  const {
-    workDir: rawWorkDir,
-    sessionId,
-    mode: _mode,
-    summary,
-    todos,
-    buttonText,
-    title,
-  } = req.body ?? {};
-  const workDir = rawWorkDir ?? getWorkDir();
-
-  const ref = getConversationRef();
-  if (!ref) {
-    return res.status(404).json({
-      success: false,
-      error:
-        "First time setup: send any message to the bot in Teams first, then retry /handoff. This is only needed once.",
-    });
-  }
-
-  try {
-    // Send handoff card to Teams — user must click Accept to switch
-    await adapter.continueConversation(ref, async (ctx: TurnContext) => {
-      const card = buildHandoffCard(
-        workDir,
-        sessionId,
-        summary,
-        todos,
-        buttonText,
-        title,
-      );
-      await ctx.sendActivity({
-        attachments: [
-          {
-            contentType: "application/vnd.microsoft.card.adaptive",
-            content: card,
-          },
-        ],
-      });
-    });
-
-    console.log("[HANDOFF] Handoff card sent to Teams");
-    res.json({ success: true });
-  } catch (err) {
-    console.error(`[HANDOFF] ${err}`);
-    res.status(500).json({
-      success: false,
-      error: "Failed to send notification",
-    });
-  }
-});
-
-app.listen(config.port, () => {
-  console.log(`Bot running on http://localhost:${config.port}/api/messages`);
-  console.log(`Working directory: ${config.claudeWorkDir}`);
 });

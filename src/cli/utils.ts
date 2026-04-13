@@ -48,6 +48,14 @@ export function runCommand(
 
     child.on("error", (error) => {
       if (timer) clearTimeout(timer);
+      if (options.allowFailure) {
+        resolve({ code: 1, stdout, stderr: stderr + "\n" + error.message });
+        return;
+      }
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        reject(new Error(`Command not found: ${command}`));
+        return;
+      }
       reject(error);
     });
 
@@ -131,17 +139,12 @@ export function readJson(filePath: string): Record<string, unknown> {
   }
 }
 
-export function writeJson(filePath: string, value: Record<string, unknown>): void {
+export function writeJson(
+  filePath: string,
+  value: Record<string, unknown>,
+): void {
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
   fs.writeFileSync(filePath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
-}
-
-export function ensureExecutable(filePath: string): void {
-  try {
-    fs.chmodSync(filePath, 0o755);
-  } catch {
-    // Ignore on filesystems/platforms that do not support chmod.
-  }
 }
 
 export function pathExistsAndNonEmpty(filePath: string): boolean {
@@ -154,9 +157,9 @@ export function pathExistsAndNonEmpty(filePath: string): boolean {
 }
 
 export async function runBuild(): Promise<void> {
-  // Skip build when installed globally (dist/ already bundled, no package.json scripts)
-  const pkgPath = path.join(projectDir, "package.json");
-  if (!fs.existsSync(pkgPath)) {
+  // Skip build when installed globally (dist/ already bundled, devDependencies not available)
+  const devDepsMarker = path.join(projectDir, "node_modules", "esbuild");
+  if (!fs.existsSync(devDepsMarker)) {
     return;
   }
   console.log("Building project...");

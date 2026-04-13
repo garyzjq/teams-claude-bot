@@ -7,16 +7,19 @@ import {
   type SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
 import { join, dirname, resolve } from "path";
+import { readFile } from "fs/promises";
 import { AsyncQueue } from "../session/async-queue.js";
 import type {
   ClaudeResult,
-  ImageInput,
   ProgressEvent,
   PromptRequestInfo,
   ToolInfo,
   OnElicitation,
 } from "./agent.js";
-import { extractToolInfo, saveImagesToTmp } from "./agent.js";
+import { extractToolInfo } from "./agent.js";
+
+/** MessageParam content — string or array of content blocks. */
+export type MessageContent = string | Record<string, unknown>[];
 
 // Resolve cli.js path explicitly. process.argv[1] is the entry file (dist/index.js or
 // src/index.ts), always one directory below the project root, so dirname x2 = root.
@@ -64,18 +67,15 @@ export class ConversationSession {
   private sessionId: string | undefined;
   private eventConsumer: Promise<void> | null = null;
   private _lastActivity = Date.now();
-  private lastPromptSuggestion: string | undefined;
 
   // Per-turn tracking (reset on each result)
   private turnTools: ToolInfo[] = [];
   private turnStreamingText = "";
   private resumeRetryAttempted = false;
-  private pendingRetry:
-    | { prompt: string; images?: ImageInput[] }
-    | undefined = undefined;
-  private lastStartPayload:
-    | { prompt: string; images?: ImageInput[] }
-    | undefined = undefined;
+  // Map tool_use_id → file_path for Read tool calls (used to send original images)
+  private readToolPaths = new Map<string, string>();
+  private pendingRetry: { content: MessageContent } | undefined = undefined;
+  private lastStartPayload: { content: MessageContent } | undefined = undefined;
 
   constructor(private config: SessionConfig) {}
 
@@ -132,11 +132,11 @@ export class ConversationSession {
    * First call starts the query; subsequent calls push to the SDK's internal queue.
    * Results are delivered via config.onResult callback.
    */
-  send(prompt: string, images?: ImageInput[]): void {
+  send(content: MessageContent): void {
     this._lastActivity = Date.now();
 
     if (!this.activeQuery) {
-      this.startQuery(prompt, images).catch((err) => {
+      this.startQuery(content).catch((err) => {
         this.emitResult({
           error: err instanceof Error ? err.message : String(err),
           tools: [],
@@ -144,7 +144,7 @@ export class ConversationSession {
       });
     } else {
       // Don't reset turn state — SDK is still processing the current turn
-      this.streamMessage(prompt, images);
+      this.streamMessage(content);
     }
   }
 
@@ -177,6 +177,7 @@ export class ConversationSession {
   private resetTurnState(): void {
     this.turnTools = [];
     this.turnStreamingText = "";
+    this.readToolPaths.clear();
   }
 
   private emitProgress(event: ProgressEvent): void {
@@ -189,20 +190,19 @@ export class ConversationSession {
     await this.config.onResult?.(result);
   }
 
-  private async startQuery(
-    prompt: string,
-    images?: ImageInput[],
-  ): Promise<void> {
-    this.lastStartPayload = { prompt, images };
+
+  private async startQuery(content: MessageContent): Promise<void> {
+    this.lastStartPayload = { content };
     console.log("[SESSION] Starting new query (first message)");
-    const finalPrompt = await preparePrompt(prompt, images);
     const options = this.buildQueryOptions();
 
     // Create queue and push first message
     this.inputQueue = new AsyncQueue<SDKUserMessage>();
     this.inputQueue.push({
       type: "user",
-      message: { role: "user", content: finalPrompt },
+      // Cast needed: SDK types MessageParam.content as string, but the CLI
+      // accepts content block arrays (image/document/text) per the Messages API.
+      message: { role: "user", content } as never,
       parent_tool_use_id: null,
       session_id: "",
     });
@@ -225,16 +225,14 @@ export class ConversationSession {
     });
   }
 
-  private async streamMessage(
-    prompt: string,
-    images?: ImageInput[],
-  ): Promise<void> {
+  private streamMessage(content: MessageContent): void {
     console.log("[SESSION] Pushing message to input queue");
-    const finalPrompt = await preparePrompt(prompt, images);
 
     this.inputQueue!.push({
       type: "user",
-      message: { role: "user", content: finalPrompt },
+      // Cast needed: SDK types MessageParam.content as string, but the CLI
+      // accepts content block arrays (image/document/text) per the Messages API.
+      message: { role: "user", content } as never,
       parent_tool_use_id: null,
       session_id: this.sessionId ?? "",
     });
@@ -255,11 +253,23 @@ export class ConversationSession {
     if (this.pendingRetry) {
       const retry = this.pendingRetry;
       this.pendingRetry = undefined;
-      await this.startQuery(retry.prompt, retry.images);
+      await this.startQuery(retry.content);
     }
   }
 
   private async processMessage(msg: Record<string, unknown>): Promise<void> {
+    const msgType = msg.type as string | undefined;
+    const msgSubtype = msg.subtype as string | undefined;
+    const extra =
+      msgType === "system" && msgSubtype === "status"
+        ? ` status=${msg.status}`
+        : msgType === "result"
+          ? ` subtype=${msgSubtype}`
+          : msgType === "stream_event"
+            ? ` evt=${(msg.event as Record<string, unknown> | undefined)?.type}`
+            : "";
+    console.log(`[SESSION] msg: type=${msgType} subtype=${msgSubtype}${extra}`);
+
     // ── Init message ──
     if (
       msg.type === "system" &&
@@ -268,6 +278,22 @@ export class ConversationSession {
     ) {
       this.sessionId = msg.session_id;
       this.config.onSessionId?.(this.sessionId);
+    }
+
+    // ── Status changes (compacting, etc.) ──
+    // SDK sends status: 'compacting' when starting, status: null when done.
+    if (msg.type === "system" && msg.subtype === "status") {
+      const status = typeof msg.status === "string" ? msg.status : "idle";
+      this.emitProgress({ type: "status", status });
+    }
+
+    // ── Local command output (e.g. /compact, /cost — SDK-handled slash commands) ──
+    if (
+      msg.type === "system" &&
+      msg.subtype === "local_command_output" &&
+      typeof msg.content === "string"
+    ) {
+      this.emitProgress({ type: "text", text: msg.content });
     }
 
     // ── Auth status ──
@@ -302,13 +328,25 @@ export class ConversationSession {
     // ── Streaming text ──
     if (msg.type === "stream_event" && msg.parent_tool_use_id === null) {
       const evt = msg.event as Record<string, unknown> | undefined;
+      if (evt?.type === "message_start") {
+        this.emitProgress({ type: "started" });
+      }
       if (evt?.type === "content_block_delta") {
         const delta = evt.delta as Record<string, unknown> | undefined;
         if (delta?.type === "text_delta" && typeof delta.text === "string") {
           this.turnStreamingText += delta.text;
           this.emitProgress({
             type: "text",
-            text: this.turnStreamingText,
+            text: delta.text,
+          });
+        }
+        if (
+          delta?.type === "thinking_delta" &&
+          typeof delta.thinking === "string"
+        ) {
+          this.emitProgress({
+            type: "thinking",
+            text: delta.thinking,
           });
         }
       }
@@ -340,8 +378,59 @@ export class ConversationSession {
     // ── User message (tool_use_result payloads from tool responses) ──
     if (msg.type === "user") {
       const toolUseResult = msg.tool_use_result;
+
+      // Skip tool errors — Claude handles retries internally, no need to show raw errors to user
+      const inner = msg.message as Record<string, unknown> | undefined;
+      const contentBlocks = Array.isArray(inner?.content)
+        ? (inner!.content as Array<Record<string, unknown>>)
+        : [];
+      const isToolError = contentBlocks.some((b) => b.is_error === true);
+      if (isToolError) {
+        // Claude sees the error and retries with adjusted params; don't surface to user
+        return;
+      }
+
+      // Nested image blocks inside tool_result content (MCP tools, etc.)
+      for (const block of contentBlocks) {
+        if (block.type === "tool_result" && Array.isArray(block.content)) {
+          for (const inner of block.content as Array<Record<string, unknown>>) {
+            if (inner.type === "image" && typeof inner.source === "object" && inner.source !== null) {
+              const src = inner.source as Record<string, unknown>;
+              if (src.type === "base64" && typeof src.data === "string") {
+                this.emitProgress({
+                  type: "image",
+                  base64: src.data,
+                  mimeType: (src.media_type as string) ?? "image/png",
+                  sizeBytes: Math.ceil(src.data.length * 3 / 4),
+                });
+              }
+            }
+          }
+        }
+      }
+
       if (toolUseResult && typeof toolUseResult === "object") {
         const payload = toolUseResult as Record<string, unknown>;
+        // FileReadOutput — image type (screenshots, image file reads)
+        if (payload.type === "image" && payload.file) {
+          await this.emitImageFromFileRead(payload, msg);
+        }
+
+        // BashOutput — isImage flag (command output screenshots)
+        if (
+          payload.isImage === true &&
+          typeof payload.stdout === "string" &&
+          payload.stdout.length > 0
+        ) {
+          const b64 = payload.stdout;
+          this.emitProgress({
+            type: "image",
+            base64: b64,
+            mimeType: "image/png",
+            sizeBytes: Math.ceil(b64.length * 3 / 4),
+          });
+        }
+
         // FileEditOutput or FileWriteOutput — extract gitDiff.patch or structuredPatch
         if (
           typeof payload.filePath === "string" &&
@@ -374,13 +463,17 @@ export class ConversationSession {
     // ── Task notifications (subagent background tasks) ──
     if (
       msg.type === "system" &&
-      (msg.subtype === "task_notification" || msg.subtype === "task_started") &&
+      (msg.subtype === "task_notification" ||
+        msg.subtype === "task_started" ||
+        msg.subtype === "task_progress") &&
       typeof msg.task_id === "string"
     ) {
       const status =
         msg.subtype === "task_started"
           ? "started"
-          : ((msg.status as string) ?? "unknown");
+          : msg.subtype === "task_progress"
+            ? "in_progress"
+            : ((msg.status as string) ?? "unknown");
       const summary =
         (msg.summary as string) ?? (msg.description as string) ?? "";
       this.emitProgress({
@@ -401,9 +494,11 @@ export class ConversationSession {
           if (
             typeof block === "object" &&
             block !== null &&
-            "type" in block &&
-            (block as Record<string, unknown>).type === "tool_use"
+            "type" in block
           ) {
+            const blockType = (block as Record<string, unknown>).type;
+
+            if (blockType !== "tool_use") continue;
             const b = block as Record<string, unknown>;
             // Emit todo updates
             if (
@@ -429,29 +524,38 @@ export class ConversationSession {
                 });
               }
             }
-            this.turnTools.push(
-              extractToolInfo(
-                (b.name as string) ?? "unknown",
-                b.input as Record<string, unknown> | undefined,
-              ),
+            // Track Read tool file paths for original image forwarding
+            if (b.name === "Read" || b.name === "FileRead") {
+              const input = b.input as Record<string, unknown> | undefined;
+              const filePath = input?.file_path as string | undefined;
+              const toolId = b.id as string | undefined;
+              if (filePath && toolId) {
+                this.readToolPaths.set(toolId, filePath);
+              }
+            }
+            const toolInfo = extractToolInfo(
+              (b.name as string) ?? "unknown",
+              b.input as Record<string, unknown> | undefined,
             );
+            this.emitProgress({ type: "tool_use", tool: toolInfo });
+            this.turnTools.push(toolInfo);
           }
         }
       }
     }
 
-    // ── Prompt suggestion ──
-    if (msg.type === "prompt_suggestion" && typeof msg.prompt === "string") {
-      this.lastPromptSuggestion = msg.prompt;
+    // ── Prompt suggestion (arrives after result) ──
+    if (msg.type === "prompt_suggestion") {
+      const suggestion = (msg.suggestion ?? msg.prompt) as string | undefined;
+      if (typeof suggestion === "string") {
+        this.emitProgress({ type: "prompt_suggestion", suggestion });
+      }
+      return;
     }
 
     // ── Result ──
     if (msg.type === "result") {
-      this.emitProgress({
-        type: "done",
-        promptSuggestion: this.lastPromptSuggestion,
-      });
-      this.lastPromptSuggestion = undefined;
+      this.emitProgress({ type: "done" });
 
       const stopReason = (msg.stop_reason as string | null) ?? null;
 
@@ -540,6 +644,58 @@ export class ConversationSession {
     }
   }
 
+  /** Extract and emit an image from a FileReadOutput tool result.
+   *  Tries to read the original file for full quality; falls back to the SDK's resized version. */
+  private async emitImageFromFileRead(
+    payload: Record<string, unknown>,
+    msg: Record<string, unknown>,
+  ): Promise<void> {
+    const file = payload.file as Record<string, unknown>;
+    const mimeType = file.type as string | undefined;
+    if (!mimeType) return;
+
+    const sdkBase64 = file.base64 as string | undefined;
+    if (typeof sdkBase64 !== "string") return;
+
+    const sdkSizeBytes = (file.originalSize as number) ?? Math.ceil(sdkBase64.length * 3 / 4);
+
+    // Find the original file path from the Read tool call.
+    // parent_tool_use_id is typically null; the real ID is inside
+    // msg.message.content[].tool_use_id (ToolResultBlockParam).
+    const toolId =
+      (msg.parent_tool_use_id as string | undefined) ??
+      (Array.isArray((msg.message as Record<string, unknown> | undefined)?.content)
+        ? ((msg.message as Record<string, unknown>).content as Array<Record<string, unknown>>)
+            .find((b) => b.type === "tool_result" && typeof b.tool_use_id === "string")
+            ?.tool_use_id as string | undefined
+        : undefined);
+    const originalPath = toolId ? this.readToolPaths.get(toolId) : undefined;
+
+    if (!originalPath) {
+      this.emitProgress({ type: "image", base64: sdkBase64, mimeType, sizeBytes: sdkSizeBytes });
+      return;
+    }
+
+    try {
+      // Resolve POSIX-style /c/... paths to Windows C:\... on win32
+      let fsPath = originalPath;
+      if (process.platform === "win32" && /^\/[a-zA-Z]\//.test(fsPath)) {
+        fsPath = fsPath[1].toUpperCase() + ":" + fsPath.slice(2).replace(/\//g, "\\");
+      }
+      const buf = await readFile(fsPath);
+      this.emitProgress({
+        type: "image",
+        base64: buf.toString("base64"),
+        mimeType,
+        name: originalPath.split(/[/\\]/).pop(),
+        sizeBytes: buf.length,
+      });
+    } catch (err) {
+      console.warn("[SESSION] Could not read original image, using SDK version:", err);
+      this.emitProgress({ type: "image", base64: sdkBase64, mimeType, sizeBytes: sdkSizeBytes });
+    }
+  }
+
   private async handlePromptRequest(
     msg: Record<string, unknown>,
   ): Promise<void> {
@@ -573,10 +729,10 @@ export class ConversationSession {
         "Glob",
         "Grep",
         "AskUserQuestion",
+        "Skill",
       ],
       permissionMode: this.config.permissionMode ?? "default",
-      allowDangerouslySkipPermissions:
-        this.config.permissionMode === "bypassPermissions",
+      allowDangerouslySkipPermissions: true,
       maxTurns: this.config.maxTurns ?? 200,
       systemPrompt: {
         type: "preset",
@@ -586,7 +742,7 @@ export class ConversationSession {
       },
       executable: process.argv[0],
       pathToClaudeCodeExecutable: CLAUDE_CLI_PATH,
-      settingSources: ["project"],
+      settingSources: ["user", "project", "local"],
       includePartialMessages: true,
       promptSuggestions: true,
       env: { ...process.env, CLAUDECODE: undefined },
@@ -625,15 +781,4 @@ function isResumeFailure(error: string): boolean {
     msg.includes("session not found") ||
     msg.includes("--resume")
   );
-}
-
-async function preparePrompt(
-  prompt: string,
-  images?: ImageInput[],
-): Promise<string> {
-  if (!images || images.length === 0) return prompt;
-
-  const paths = await saveImagesToTmp(images);
-  const imageRefs = paths.map((p) => `[Uploaded image: ${p}]`).join("\n");
-  return `The user sent the following image(s). Use the Read tool to view them:\n${imageRefs}\n\n${prompt}`;
 }

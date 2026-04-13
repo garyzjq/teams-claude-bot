@@ -2,38 +2,16 @@
 
 ## Prerequisites
 
-- Azure account (free tier works)
-- Microsoft Teams — personal Microsoft account recommended (enterprise accounts may require Service Tree IDs, admin consent, and other org-specific policies)
 - Node.js 22+
 - Claude Code CLI installed
+- [Azure account](https://azure.microsoft.com/free/) — free tier is enough. Personal Microsoft account recommended (enterprise accounts may require Service Tree IDs and extra approvals)
+- Microsoft Teams
 
-## 1. Create Azure Bot Registration
+## Quick Setup (Recommended)
 
-1. Go to [Azure Portal](https://portal.azure.com) → Create a resource → "Azure Bot"
-2. Fill in:
-   - **Bot handle**: choose a unique name
-   - **Pricing tier**: F0 (free) for development
-   - **Microsoft App ID**: Create new
-   - **App type**: Single Tenant
-3. Click Create
+Automated setup creates everything via `az` CLI — App Registration, Bot, Dev Tunnel, and manifest in one command.
 
-### Switch to Multi Tenant (personal accounts only)
-
-If you're using a personal Microsoft account:
-
-1. Go to [App Registrations](https://portal.azure.com/#view/Microsoft_AAD_RegisteredApps/ApplicationsListBlade) → find your app
-2. Manifest → set `signInAudience` to `AzureADandPersonalMicrosoftAccount`
-3. Save
-
-> Without this, only users in the same Azure AD tenant can use the bot. Enterprise accounts can skip this step.
-
-### Get credentials
-
-1. Go to [App Registrations](https://portal.azure.com/#view/Microsoft_AAD_RegisteredApps/ApplicationsListBlade) → find your app
-2. Overview → copy the **Application (client) ID** and **Directory (tenant) ID**
-3. Certificates & secrets → New client secret → copy the **Value** (this is your App Password)
-
-## 2. Install
+### 1. Install
 
 ```bash
 npm install -g claude-code-teams-bot
@@ -47,7 +25,73 @@ cd teams-claude-bot
 npm install && npm run build
 ```
 
-## 3. Configure
+### 2. Run automated setup
+
+```bash
+teams-bot setup --auto
+```
+
+This single command will:
+- Install `az` CLI if not found (via brew/apt/winget)
+- Open browser for Azure login (use a **personal Microsoft account**)
+- Create Azure App Registration, client secret, Bot resource, and Teams channel
+- Open browser for Dev Tunnel login (**any Microsoft account**)
+- Create a Dev Tunnel and set the messaging endpoint
+- Generate manifest and sideload to Teams (opens browser — sign in with the **Teams account you'll chat from**)
+- Install and start the background service
+- Run a health check
+- Open the bot chat in Teams
+
+Send "hello" to the bot — you should get a response from Claude Code.
+
+---
+
+## Manual Setup
+
+If automated setup doesn't work for your environment (e.g. enterprise accounts with restricted policies), you can set things up manually.
+
+### 1. Create Azure Bot Registration
+
+1. Go to [Azure Portal](https://portal.azure.com) → Create a resource → "Azure Bot"
+2. Fill in:
+   - **Bot handle**: choose a unique name
+   - **Pricing tier**: F0 (free) for development
+   - **Microsoft App ID**: Create new
+   - **App type**: Single Tenant
+3. Click Create
+4. Once created, go to **Channels** → click **Microsoft Teams** → Accept Terms of Service → **Apply**
+
+#### Switch to Multi Tenant (personal accounts only)
+
+If you're using a personal Microsoft account:
+
+1. Go to [App Registrations](https://portal.azure.com/#view/Microsoft_AAD_RegisteredApps/ApplicationsListBlade) → find your app
+2. Manifest → set `signInAudience` to `AzureADMultipleOrgs`
+3. Save
+
+> Without this, only users in the same Azure AD tenant can use the bot. Enterprise accounts can skip this step.
+
+#### Get credentials
+
+1. Go to [App Registrations](https://portal.azure.com/#view/Microsoft_AAD_RegisteredApps/ApplicationsListBlade) → find your app
+2. Overview → copy the **Application (client) ID** and **Directory (tenant) ID**
+3. Certificates & secrets → New client secret → copy the **Value** (this is your App Password)
+
+### 2. Install
+
+```bash
+npm install -g claude-code-teams-bot
+```
+
+Or install from source:
+
+```bash
+git clone https://github.com/Marvae/teams-claude-bot.git
+cd teams-claude-bot
+npm install && npm run build
+```
+
+### 3. Configure
 
 ```bash
 teams-bot setup
@@ -59,7 +103,7 @@ Enter the credentials from step 1 when prompted. Setup will also:
 - Install the `/handoff` skill for Claude Code (enables Terminal ↔ Teams handoff). You can also run `teams-bot install-skill` later.
 - Generate `teams-claude-bot.zip` for step 5.
 
-## 4. Set Messaging Endpoint
+### 4. Set Messaging Endpoint
 
 `teams-bot setup` should have created a Dev Tunnel and printed the endpoint URL. If not, see [Manual Tunnel Setup](#manual-tunnel-setup).
 
@@ -73,34 +117,38 @@ https://<your-tunnel-id>-3978.devtunnels.ms/api/messages
 
 > `<your-tunnel-id>` is the tunnel name you chose during setup (e.g. `teams-bot`).
 
-## 5. Sideload to Teams
+### 5. Sideload to Teams
 
-### Option A: Upload in Teams
+#### Option A: Upload in Teams
 
 In Teams → Apps → Manage your apps → Upload an app → Upload a custom app → select `teams-claude-bot.zip` (generated by setup)
 
 To regenerate: `teams-bot package`
 
-### Option B: Teams Developer Portal
+#### Option B: Teams Developer Portal
 
 1. Go to [Teams Developer Portal](https://dev.teams.microsoft.com/apps)
 2. Import app → select `manifest/manifest.json`
 3. Update the Bot ID field with your App ID
 4. Preview in Teams
 
-## 6. Start
+### 6. Start
 
-This registers the bot as a background service (launchd/systemd) so it runs automatically:
+This registers the bot as a background service (launchd/systemd/scheduled task) so it runs automatically:
 
 ```bash
 teams-bot install
 ```
 
-## 7. Verify
+> **Windows:** Run your terminal as **Administrator** (right-click → Run as administrator). The scheduled task registration requires elevated privileges. If you can't run as admin, use `teams-bot start` instead (runs in background but won't auto-start after reboot).
+
+### 7. Verify
 
 - Run `teams-bot health` to check the service and tunnel are working
 - Send "hello" to the bot in Teams — you should get a response from Claude Code (this also activates handoff by storing your conversation ID)
 - Run `teams-bot logs` to see output if something isn't working
+
+---
 
 ## Troubleshooting
 
@@ -121,6 +169,34 @@ teams-bot install
 - The `botId` in manifest must be the **Application (client) ID** (a UUID) from [App Registrations](https://portal.azure.com/#view/Microsoft_AAD_RegisteredApps/ApplicationsListBlade) → your app → Overview
 - Re-run `teams-bot setup` with the correct ID, then `teams-bot package` to regenerate the zip
 - Or fix it directly in [Teams Developer Portal](https://dev.teams.microsoft.com/apps) → your app → App features → Bot → paste the correct ID
+
+### Teams doesn't recognize the bot ID (upload succeeds but bot doesn't work)
+
+The most likely cause is that the **Microsoft Teams channel** is not enabled on your Azure Bot resource.
+
+To fix:
+
+1. Open your Azure Bot resource in [Azure Portal](https://portal.azure.com)
+2. Go to **Channels** → click **Microsoft Teams**
+3. Accept Terms of Service → **Apply**
+4. Re-upload `teams-claude-bot.zip` to Teams
+
+### `az login` fails with AADSTS50076 (MFA required)
+
+If your Microsoft account is a guest in a corporate tenant that requires MFA, `az login` may fail with:
+
+```
+Authentication failed against tenant xxx '默认目录': AADSTS50076 ...
+No subscriptions found for user@example.com
+```
+
+Fix: log in specifying the tenant that has your subscription:
+
+```bash
+az login --tenant <TENANT_ID>
+```
+
+You can find your tenant ID in [Azure Portal](https://portal.azure.com) → Microsoft Entra ID → Overview → Tenant ID. After logging in, re-run `teams-bot setup --auto`.
 
 ### Tunnel auth expired
 
