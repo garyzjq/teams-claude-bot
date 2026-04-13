@@ -118,7 +118,7 @@ export function destroySession(): void {
 // ─── In-memory preferences (reset on restart) ───
 
 let workDir: string = config.claudeWorkDir;
-let model: string | undefined = "claude-opus-4-6";
+let model: string | undefined;
 let thinkingTokens: number | null | undefined;
 let permissionMode: string = config.defaultPermissionMode;
 let handoffMode: "pickup" | undefined;
